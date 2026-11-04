@@ -1,0 +1,17 @@
+
+# Multi-agent AI framework
+autogen-agentchat>=0.4.0
+autogen-ext[openai]>=0.4.0
+
+# Streamlit frontend
+streamlit>=1.40.0
+
+# Environment and configuration
+python-dotenv>=1.0.0
+
+# Data processing and ticket logging
+pandas>=2.2.0
+openpyxl>=3.1.0
+
+# Optional external search (DDGS)
+ddgs>=9.0.0
