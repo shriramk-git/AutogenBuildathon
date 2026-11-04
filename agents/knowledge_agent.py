@@ -1,9 +1,13 @@
+"""Agent 2: Retrieves policy evidence from the local Markdown knowledge base.
 
-"""Agent 2: Retrieves relevant company knowledge using local keyword-based RAG."""
+This module uses lightweight, section-aware keyword retrieval. It does not
+require embeddings, a vector database, or additional packages.
+"""
 
 import json
 import re
 from collections import Counter
+from pathlib import Path
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -11,69 +15,78 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from config import KNOWLEDGE_BASE_DIR, MAX_KB_RESULTS
 
 
-# Common words excluded from keyword matching.
 STOP_WORDS = {
-    "the", "is", "a", "an", "and", "or", "to", "of", "in",
-    "for", "on", "with", "my", "i", "me", "it", "this",
-    "that", "what", "how", "when", "where", "can", "do",
-    "does", "was", "were", "are", "be", "have", "has",
-    "had", "you", "your", "we", "our", "please", "from",
-    "am", "will", "would", "could", "should", "isnt", "dont",
-    "not", "about", "tell", "know", "want", "need"
+    "a", "an", "and", "are", "as", "at", "be", "been", "being",
+    "can", "could", "did", "do", "does", "for", "from", "had",
+    "has", "have", "how", "i", "if", "in", "is", "it", "me",
+    "my", "of", "on", "or", "our", "please", "should", "so",
+    "that", "the", "their", "them", "there", "this", "to", "was",
+    "we", "were", "what", "when", "where", "which", "who", "why",
+    "will", "with", "would", "you", "your",
 }
 
-
-# Lightweight vocabulary expansion for common customer language.
+# Small, explicit vocabulary expansion for common e-commerce language.
 SYNONYMS = {
-    "late": ["delay", "delayed", "shipping", "delivery"],
-    "delay": ["late", "delayed", "shipping", "delivery"],
-    "delayed": ["delay", "late", "shipping", "delivery"],
+    "late": ["delay", "delayed", "delivery", "shipment"],
+    "delay": ["late", "delayed", "delivery", "shipment"],
+    "delayed": ["delay", "late", "delivery", "shipment"],
     "arrive": ["delivery", "shipping", "dispatch"],
-    "order": ["shipping", "delivery", "tracking"],
-    "refund": ["return", "money", "reimbursement"],
+    "arrived": ["delivery", "shipping", "dispatch"],
+    "order": ["shipment", "delivery", "tracking"],
+    "package": ["parcel", "order", "shipment"],
+    "parcel": ["package", "order", "shipment"],
+    "shipment": ["package", "parcel", "delivery"],
+    "refund": ["reimbursement", "money back", "return"],
+    "money": ["refund", "payment", "reimbursement"],
     "return": ["refund", "replacement"],
-    "broken": ["damaged", "defective", "replacement"],
-    "damaged": ["broken", "defective", "replacement"],
-    "defective": ["broken", "damaged", "replacement"],
+    "broken": ["damaged", "defective"],
+    "damage": ["damaged", "defective", "broken"],
+    "damaged": ["damage", "defective", "broken"],
+    "defective": ["broken", "damaged", "faulty"],
+    "faulty": ["defective", "broken", "damaged"],
+    "exchange": ["replacement", "return"],
+    "replace": ["replacement", "exchange"],
+    "replacement": ["replace", "exchange", "damaged"],
     "password": ["login", "account", "reset"],
+    "forgot": ["forgotten", "reset", "password"],
     "login": ["password", "account", "access"],
+    "locked": ["account", "login", "access"],
     "charged": ["payment", "billing", "transaction"],
     "charge": ["payment", "billing", "transaction"],
     "card": ["payment", "billing", "transaction"],
-    "multiple": ["duplicate", "charged", "payment"],
     "duplicate": ["multiple", "charged", "payment"],
-    "replacement": ["damaged", "broken", "defective"],
+    "twice": ["duplicate", "multiple", "charged"],
+    "tracking": ["shipment", "delivery", "courier"],
+    "courier": ["delivery", "shipment", "tracking"],
+    "otp": ["verification", "login", "account"],
+    "email": ["account", "login", "verification"],
     "cancel": ["cancellation", "refund"],
     "cancelled": ["cancellation", "refund"],
     "cancellation": ["cancel", "refund"],
-    "tracking": ["shipment", "delivery", "order"],
-    "email": ["account", "login", "verification"],
-    "locked": ["account", "login", "access"],
 }
 
 
 def tokenize(text: str) -> list[str]:
-    """Convert text into searchable lowercase keywords."""
-
-    words = re.findall(r"[a-z0-9]+", text.lower())
+    """Return searchable lowercase words, excluding common stop words."""
+    words = re.findall(r"[a-z0-9]+", str(text).lower())
     return [word for word in words if word not in STOP_WORDS]
 
 
 def expand_query(tokens: list[str]) -> set[str]:
-    """Expand customer keywords with relevant business synonyms."""
-
+    """Add known customer-language synonyms without replacing original terms."""
     expanded = set(tokens)
-
     for word in tokens:
         expanded.update(SYNONYMS.get(word, []))
-
     return expanded
 
 
 def load_kb_passages() -> list[dict[str, str]]:
-    """Load Markdown documents and split them into searchable passages."""
+    """Load Markdown files into section-aware passages.
 
-    passages = []
+    Each passage retains its filename and heading path so the agent can cite
+    the precise policy section instead of only naming a whole document.
+    """
+    passages: list[dict[str, str]] = []
 
     if not KNOWLEDGE_BASE_DIR.exists():
         return passages
@@ -81,169 +94,230 @@ def load_kb_passages() -> list[dict[str, str]]:
     for file_path in sorted(KNOWLEDGE_BASE_DIR.glob("*.md")):
         try:
             content = file_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             continue
 
-        # Split documents at blank lines.
-        chunks = re.split(r"\n\s*\n", content)
+        heading_stack: list[tuple[int, str]] = []
+        current_blocks: list[str] = []
 
-        for chunk in chunks:
-            cleaned = chunk.strip()
+        def save_section() -> None:
+            if not current_blocks:
+                return
 
-            if cleaned:
+            heading = " > ".join(item[1] for item in heading_stack)
+            body = "\n\n".join(current_blocks).strip()
+
+            if body:
+                # Keep the heading with the passage so heading terms can
+                # participate in retrieval and be shown as a source citation.
                 passages.append({
                     "source": file_path.name,
-                    "content": cleaned
+                    "section": heading or "General information",
+                    "content": body,
+                    "search_text": f"{heading}\n{body}",
                 })
+
+        for line in content.splitlines():
+            heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
+
+            if heading_match:
+                save_section()
+                current_blocks = []
+
+                level = len(heading_match.group(1))
+                heading_text = heading_match.group(2).strip()
+
+                heading_stack = [
+                    (old_level, old_heading)
+                    for old_level, old_heading in heading_stack
+                    if old_level < level
+                ]
+                heading_stack.append((level, heading_text))
+                continue
+
+            if not line.strip():
+                continue
+
+            current_blocks.append(line.strip())
+
+        save_section()
 
     return passages
 
 
 def search_kb(query: str) -> str:
-    """
-    Search company Markdown documents and return up to three relevant passages.
-
-    Args:
-        query: Customer complaint or search query.
-
-    Returns:
-        JSON containing relevant passages and source filenames.
-    """
-
-    if not query or not query.strip():
+    """Retrieve relevant policy sections and return source-grounded JSON."""
+    if not isinstance(query, str) or not query.strip():
         return json.dumps({
             "found": False,
             "message": "Empty search query.",
-            "results": []
+            "results": [],
         })
 
     passages = load_kb_passages()
-
     if not passages:
         return json.dumps({
             "found": False,
             "message": "No company knowledge documents found.",
-            "results": []
+            "results": [],
         })
 
-    query_tokens = expand_query(tokenize(query))
-
-    if not query_tokens:
+    original_tokens = tokenize(query)
+    if not original_tokens:
         return json.dumps({
             "found": False,
             "message": "No searchable keywords found.",
-            "results": []
+            "results": [],
         })
 
-    scored_passages = []
+    original_set = set(original_tokens)
+    expanded_set = expand_query(original_tokens)
 
-    # Score each passage using original customer keywords and synonyms.
+    # Count in how many passages each term occurs. Rare terms receive more
+    # weight than common terms, similar to inverse document frequency.
+    document_frequency = Counter()
+    passage_token_data = []
+
     for passage in passages:
-        passage_tokens = tokenize(passage["content"])
-        token_counts = Counter(passage_tokens)
+        body_tokens = tokenize(passage["content"])
+        heading_tokens = tokenize(passage["section"])
+        all_tokens = set(body_tokens + heading_tokens)
+        passage_token_data.append((body_tokens, heading_tokens, all_tokens))
 
-        matched_terms = query_tokens.intersection(token_counts)
+        for term in all_tokens:
+            document_frequency[term] += 1
 
-        if not matched_terms:
+    total_passages = max(len(passages), 1)
+    scored: list[dict] = []
+
+    for passage, (body_tokens, heading_tokens, all_tokens) in zip(
+        passages, passage_token_data
+    ):
+        original_matches = original_set.intersection(all_tokens)
+        synonym_matches = (expanded_set - original_set).intersection(all_tokens)
+
+        if not original_matches:
             continue
 
-        # Give original query terms more importance than expanded synonyms.
-        original_tokens = set(tokenize(query))
+        # IDF rewards distinctive query terms. Heading matches get an
+        # additional boost because headings describe the policy topic.
+        score = 0.0
+        for term in original_matches:
+            idf = 1.0 + (
+                total_passages / (1 + document_frequency[term])
+            ) ** 0.5
+            score += idf * (2.0 if term in heading_tokens else 1.0)
 
-        original_matches = matched_terms.intersection(original_tokens)
-        synonym_matches = matched_terms - original_tokens
+        for term in synonym_matches:
+            idf = 1.0 + (
+                total_passages / (1 + document_frequency[term])
+            ) ** 0.5
+            score += idf * 0.25
 
-        score = (
-            len(original_matches) * 2.0
-            + len(synonym_matches) * 0.75
-        )
+        coverage = len(original_matches) / max(len(original_set), 1)
+        score += coverage * 2.0
 
-        # Slightly reward repeated relevant terms.
-        repetition_bonus = sum(
-            min(token_counts[word] - 1, 2) * 0.1
-            for word in matched_terms
-        )
+        # Exact adjacent phrase matches are useful evidence, but not the
+        # sole basis for accepting a passage.
+        normalized_query = " ".join(original_tokens)
+        normalized_content = " ".join(tokenize(passage["search_text"]))
+        if len(original_tokens) > 1 and normalized_query in normalized_content:
+            score += 2.0
 
-        score += repetition_bonus
-
-        # Reward passages that cover more of the original query.
-        coverage = (
-            len(original_matches) / len(original_tokens)
-            if original_tokens else 0
-        )
-
-        score += coverage
-
-        scored_passages.append({
+        scored.append({
             "source": passage["source"],
-            "content": passage["content"],
-            "score": round(score, 3),
-            "matched_terms": sorted(matched_terms)
+            "section": passage["section"],
+            "passage": passage["content"],
+            "relevance_score": round(score, 3),
+            "query_coverage": round(coverage, 3),
+            "matched_terms": sorted(original_matches),
         })
 
-    # Highest relevance first, with stable ordering for ties.
-    scored_passages.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
-
-    # Require at least one original customer keyword match.
-    # Synonym-only matches are not sufficient evidence.
-    relevant_passages = [
-        item for item in scored_passages
-        if set(tokenize(query)).intersection(item["matched_terms"])
-    ]
-
-    if not relevant_passages:
+    if not scored:
         return json.dumps({
             "found": False,
             "message": (
-                "No sufficiently relevant information found "
-                "in company knowledge documents."
+                "No relevant policy section matched the customer's "
+                "original keywords. Do not infer an answer."
             ),
-            "results": []
+            "results": [],
         })
 
-    # Return no more than the configured maximum.
-    result_limit = min(MAX_KB_RESULTS, 3)
-    results = relevant_passages[:result_limit]
+    scored.sort(
+        key=lambda item: (
+            item["relevance_score"],
+            item["query_coverage"],
+        ),
+        reverse=True,
+    )
+
+    # Reject weak one-word matches for longer questions. Short, focused
+    # questions can still retrieve a section with one meaningful match.
+    meaningful_matches_required = 1 if len(original_set) <= 2 else 2
+
+    relevant = [
+        item for item in scored
+        if len(item["matched_terms"]) >= meaningful_matches_required
+        and item["query_coverage"] >= (
+            0.25 if len(original_set) <= 2 else 0.20
+        )
+    ]
+
+    if not relevant:
+        return json.dumps({
+            "found": False,
+            "message": (
+                "No sufficiently relevant policy evidence was found. "
+                "Do not answer from assumptions; refer the case to support."
+            ),
+            "results": [],
+        })
+
+    # Avoid returning several nearly identical sections from one file when
+    # other policy documents contain distinct, useful evidence.
+    selected: list[dict] = []
+    seen_sections: set[tuple[str, str]] = set()
+    limit = max(1, min(int(MAX_KB_RESULTS), 3))
+
+    for item in relevant:
+        identity = (item["source"], item["section"])
+        if identity in seen_sections:
+            continue
+        selected.append(item)
+        seen_sections.add(identity)
+        if len(selected) >= limit:
+            break
 
     return json.dumps({
         "found": True,
-        "results": [
-            {
-                "source": item["source"],
-                "passage": item["content"],
-                "relevance_score": item["score"]
-            }
-            for item in results
-        ]
+        "results": selected,
     }, indent=2)
 
 
 KNOWLEDGE_AGENT_PROMPT = """
 You are Kovai Cart's Knowledge Base Agent.
 
-YOUR RESPONSIBILITY:
-Retrieve accurate company policy information from the local
-Markdown knowledge base using the search_kb Python tool.
+RESPONSIBILITY:
+Retrieve policy evidence from the local Markdown knowledge base by using
+the search_kb Python tool. You do not write the customer-facing response.
 
-RULES:
-1. Always call the search_kb Python tool.
-2. Search using the customer's original complaint and the
-   classification summary provided by QueryAgent.
-3. Return no more than 3 relevant passages.
-4. Include the exact source filename for every retrieved passage.
-5. Preserve the meaning of the retrieved passages.
-6. Never invent policies, procedures, timelines or company information.
-7. Do not use general knowledge as a substitute for company policy.
-8. If no sufficiently relevant information is found, explicitly
-   report NOT_FOUND.
-9. Distinguish between confirmed policy information and missing information.
-10. Do not write the customer-facing response.
-11. Do not make escalation decisions.
-12. Pass the retrieved evidence and source filenames clearly
-    to ResolutionAgent.
+RETRIEVAL RULES:
+1. Always call search_kb.
+2. Search the customer's original complaint. Include the QueryAgent summary
+   in the search query when it adds useful context.
+3. Use only the passages returned by search_kb as company-policy evidence.
+4. Return no more than 3 passages.
+5. Preserve each passage's exact source filename and section heading.
+6. Do not treat a relevance score as proof that a policy applies.
+7. If found is false, report NOT_FOUND and do not infer a policy.
+8. If evidence covers only part of the question, clearly identify what is
+   supported and what is not covered.
+9. Never invent eligibility, exceptions, refund approvals, timelines,
+   inventory, tracking updates, or actions performed by the company.
+10. Do not use general knowledge as a substitute for company policy.
+11. Do not make urgency, sentiment, or escalation decisions.
+12. Pass the evidence, filenames, and section headings clearly to
+    ResolutionAgent.
 
 OUTPUT FORMAT:
 
@@ -251,26 +325,28 @@ KNOWLEDGE_STATUS:
 FOUND or NOT_FOUND
 
 RETRIEVED_PASSAGES:
-[Relevant passages returned by search_kb, up to 3]
+For each result, include:
+- Source filename
+- Section heading
+- Retrieved policy passage
 
 SOURCES:
-[Exact Markdown filenames, or None]
+List unique source filenames and their section headings, or None.
 
-If no relevant information is found, do not create or assume
-a policy answer.
+If the knowledge base does not contain enough evidence to answer the
+customer's question, explicitly report NOT_FOUND or PARTIALLY_FOUND.
 """
 
 
 def create_knowledge_agent(
     model_client: OpenAIChatCompletionClient,
 ) -> AssistantAgent:
-    """Create the knowledge retrieval agent with its Python search tool."""
-
+    """Create the knowledge agent with its local retrieval tool."""
     return AssistantAgent(
         name="KnowledgeAgent",
         description=(
-            "Searches company Markdown documents and retrieves "
-            "relevant, source-grounded policy passages."
+            "Retrieves relevant company policy sections with source "
+            "filenames and heading-level citations."
         ),
         model_client=model_client,
         tools=[search_kb],

@@ -1,12 +1,18 @@
+"""Agent 4: Records tickets and manages deterministic human escalation.
 
-"""Agent 4: Records tickets and manages deterministic human escalation."""
+CSV columns and the log_ticket() tool signature are kept compatible with
+the existing Kovai Cart AutoGen 0.7.5 workflow.
+"""
 
 import csv
+import hashlib
 import json
 import os
 import re
-import secrets
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -14,8 +20,8 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from config import TICKETS_FILE
 
 
-# CSV structure required for ticket records.
-# Confidence is included to make escalation decisions auditable.
+# Keep this schema unchanged so the existing Streamlit UI and tests continue
+# to read the same fields.
 CSV_COLUMNS = [
     "ticket_id",
     "timestamp",
@@ -32,11 +38,19 @@ CSV_COLUMNS = [
     "escalation_reason",
 ]
 
+# A repeated submission with the same customer, order ID and complaint within
+# this period returns the original ticket instead of creating another row.
+DUPLICATE_WINDOW_SECONDS = 300
+
+# Protects migration, duplicate checking and appending inside this Python
+# process (including concurrent Streamlit sessions).
+_CSV_LOCK = threading.RLock()
+
 
 def detect_risk_signals(complaint: str) -> tuple[bool, bool]:
     """Detect legal threats and fraud or payment dispute signals."""
 
-    text = complaint.lower()
+    text = (complaint or "").lower()
 
     legal_patterns = [
         r"\blawyer\b",
@@ -68,7 +82,6 @@ def detect_risk_signals(complaint: str) -> tuple[bool, bool]:
     legal_threat = any(
         re.search(pattern, text) for pattern in legal_patterns
     )
-
     payment_dispute = any(
         re.search(pattern, text) for pattern in payment_patterns
     )
@@ -83,11 +96,7 @@ def decide_escalation(
     confidence: str,
     complaint: str,
 ) -> tuple[str, str]:
-    """
-    Apply deterministic rules to decide whether human support is needed.
-
-    High-risk complaints are escalated independently of AI confidence.
-    """
+    """Apply the existing deterministic human-escalation rules."""
 
     reasons = []
 
@@ -95,7 +104,7 @@ def decide_escalation(
     sentiment_value = (sentiment or "").strip().lower()
     confidence_value = (confidence or "").strip().lower()
 
-    # Escalate urgent or unrecognized classifications.
+    # High urgency and unknown urgency classifications are escalated.
     if urgency_value == "high":
         reasons.append("High urgency")
     elif urgency_value not in {"low", "medium"}:
@@ -105,7 +114,7 @@ def decide_escalation(
     if sentiment_value == "angry":
         reasons.append("Angry customer")
 
-    # Escalate when company policy evidence is unavailable.
+    # Escalate when relevant company knowledge is unavailable.
     if not knowledge_found:
         reasons.append("No matching knowledge document")
 
@@ -115,8 +124,7 @@ def decide_escalation(
     elif confidence_value not in {"high", "medium"}:
         reasons.append("Unrecognized confidence level")
 
-    # Detect serious risks directly from the original complaint.
-    # These checks do not depend on the AI classification.
+    # Detect risk directly from the original complaint.
     legal_threat, payment_dispute = detect_risk_signals(complaint)
 
     if legal_threat:
@@ -131,66 +139,177 @@ def decide_escalation(
     return "Resolved", ""
 
 
-def ensure_csv_schema() -> None:
-    """
-    Ensure the existing ticket CSV uses the current column structure.
+def _normalize_for_duplicate_check(value: str | None) -> str:
+    """Normalize text so trivial whitespace/case differences still match."""
 
-    Older ticket records are preserved. Historical records receive
-    'Unknown' for confidence because that information was not recorded
-    in the previous CSV format.
-    """
+    return " ".join((value or "").strip().casefold().split())
 
-    TICKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    if not TICKETS_FILE.exists() or TICKETS_FILE.stat().st_size == 0:
-        return
+def _duplicate_fingerprint(
+    customer_name: str,
+    order_id: str,
+    complaint: str,
+) -> str:
+    """Create a stable fingerprint without storing extra CSV columns."""
 
-    with TICKETS_FILE.open(
-        mode="r",
-        newline="",
-        encoding="utf-8",
-    ) as csvfile:
-        reader = csv.DictReader(csvfile)
-
-        if reader.fieldnames == CSV_COLUMNS:
-            return
-
-        existing_rows = list(reader)
-
-    temp_file = TICKETS_FILE.with_name(
-        TICKETS_FILE.name + ".tmp"
+    parts = (
+        _normalize_for_duplicate_check(customer_name or "Customer"),
+        _normalize_for_duplicate_check(order_id or "Not provided"),
+        _normalize_for_duplicate_check(complaint),
     )
+    raw_value = "\x1f".join(parts).encode("utf-8")
+    return hashlib.sha256(raw_value).hexdigest()
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    """Parse a stored ISO timestamp into an aware datetime."""
 
     try:
-        with temp_file.open(
-            mode="w",
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_recent_duplicate(
+    rows: list[dict[str, str]],
+    customer_name: str,
+    order_id: str,
+    complaint: str,
+) -> dict[str, str] | None:
+    """Return a matching recent ticket, if one exists."""
+
+    target_fingerprint = _duplicate_fingerprint(
+        customer_name,
+        order_id,
+        complaint,
+    )
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(seconds=DUPLICATE_WINDOW_SECONDS)
+
+    # Search newest records first.
+    for row in reversed(rows):
+        existing_fingerprint = _duplicate_fingerprint(
+            row.get("customer_name", ""),
+            row.get("order_id", ""),
+            row.get("complaint", ""),
+        )
+
+        if existing_fingerprint != target_fingerprint:
+            continue
+
+        created_at = _parse_timestamp(row.get("timestamp", ""))
+        if created_at is None:
+            continue
+
+        if cutoff <= created_at <= now + timedelta(seconds=5):
+            return row
+
+    return None
+
+
+def ensure_csv_schema() -> None:
+    """Create or migrate the CSV while preserving existing ticket records."""
+
+    with _CSV_LOCK:
+        TICKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        if not TICKETS_FILE.exists() or TICKETS_FILE.stat().st_size == 0:
+            return
+
+        try:
+            with TICKETS_FILE.open(
+                mode="r",
+                newline="",
+                encoding="utf-8-sig",
+            ) as csvfile:
+                reader = csv.DictReader(csvfile)
+                existing_headers = reader.fieldnames or []
+                existing_rows = list(reader)
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            raise RuntimeError(
+                f"Could not read ticket CSV safely: {exc}"
+            ) from exc
+
+        if existing_headers == CSV_COLUMNS:
+            return
+
+        # A non-empty file without a usable header is unsafe to migrate
+        # automatically. Stop rather than silently losing customer records.
+        if not existing_headers:
+            raise RuntimeError(
+                "Ticket CSV has no readable header. Back it up and inspect "
+                "the file before logging new tickets."
+            )
+
+        temp_file = TICKETS_FILE.with_name(
+            f"{TICKETS_FILE.name}.tmp"
+        )
+
+        try:
+            with temp_file.open(
+                mode="w",
+                newline="",
+                encoding="utf-8",
+            ) as csvfile:
+                writer = csv.DictWriter(
+                    csvfile,
+                    fieldnames=CSV_COLUMNS,
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+
+                for old_row in existing_rows:
+                    # Ignore DictReader's overflow field if a malformed row
+                    # contains more values than the header.
+                    if None in old_row:
+                        old_row.pop(None, None)
+
+                    migrated_row = {
+                        column: old_row.get(column, "") or ""
+                        for column in CSV_COLUMNS
+                    }
+
+                    if not migrated_row["confidence"]:
+                        migrated_row["confidence"] = "Unknown"
+
+                    writer.writerow(migrated_row)
+
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+
+            # Atomic replacement prevents readers from seeing a half-written
+            # migrated CSV.
+            os.replace(temp_file, TICKETS_FILE)
+
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not safely migrate ticket CSV: {exc}"
+            ) from exc
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
+
+
+def _read_ticket_rows() -> list[dict[str, str]]:
+    """Read the current CSV while the caller holds the CSV lock."""
+
+    if not TICKETS_FILE.exists() or TICKETS_FILE.stat().st_size == 0:
+        return []
+
+    try:
+        with TICKETS_FILE.open(
+            mode="r",
             newline="",
             encoding="utf-8",
         ) as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=CSV_COLUMNS,
-                extrasaction="ignore",
-            )
-
-            writer.writeheader()
-
-            for old_row in existing_rows:
-                migrated_row = {
-                    column: old_row.get(column, "")
-                    for column in CSV_COLUMNS
-                }
-
-                if not migrated_row["confidence"]:
-                    migrated_row["confidence"] = "Unknown"
-
-                writer.writerow(migrated_row)
-
-        os.replace(temp_file, TICKETS_FILE)
-
-    finally:
-        if temp_file.exists():
-            temp_file.unlink()
+            return list(csv.DictReader(csvfile))
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        raise RuntimeError(
+            f"Could not read ticket records: {exc}"
+        ) from exc
 
 
 def log_ticket(
@@ -205,34 +324,27 @@ def log_ticket(
     customer_name: str = "Customer",
     order_id: str = "Not provided",
 ) -> str:
-    """
-    Evaluate escalation and append a complete ticket to the CSV log.
+    """Evaluate escalation and append a complete ticket to the CSV log.
 
-    Args:
-        complaint: Original customer complaint.
-        category: Classified complaint category.
-        urgency: Low, Medium, or High.
-        sentiment: Customer sentiment.
-        kb_sources: Retrieved knowledge document filenames.
-        response: Final customer-facing response.
-        confidence: High, Medium, or Low.
-        knowledge_found: Whether relevant company knowledge was found.
-        customer_name: Customer's name.
-        order_id: Customer's order reference.
+    The public signature is intentionally unchanged for AutoGen tool use.
 
-    Returns:
-        JSON containing ticket ID, status and escalation reason.
+    Repeated submissions with the same customer, order ID and complaint
+    within DUPLICATE_WINDOW_SECONDS return the existing ticket instead of
+    appending a second record.
     """
 
-    TICKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not isinstance(complaint, str) or not complaint.strip():
+        raise ValueError("A non-empty customer complaint is required.")
+
+    customer_name = (customer_name or "Customer").strip() or "Customer"
+    order_id = (order_id or "Not provided").strip() or "Not provided"
 
     # Normalize confidence to a recognized value.
     confidence_value = (confidence or "").strip().capitalize()
-
     if confidence_value not in {"High", "Medium", "Low"}:
         confidence_value = "Low"
 
-    # Make the escalation decision using deterministic rules.
+    # Preserve the existing deterministic escalation rules.
     status, escalation_reason = decide_escalation(
         urgency=urgency,
         sentiment=sentiment,
@@ -241,48 +353,88 @@ def log_ticket(
         complaint=complaint,
     )
 
-    ticket_id = f"KOV-{secrets.token_hex(4).upper()}"
+    ticket_id = f"KOV-{os.urandom(4).hex().upper()}"
 
     ticket = {
         "ticket_id": ticket_id,
         "timestamp": datetime.now().astimezone().isoformat(
             timespec="seconds"
         ),
-        "customer_name": customer_name or "Customer",
-        "order_id": order_id or "Not provided",
-        "complaint": complaint,
-        "category": category,
-        "urgency": urgency,
-        "sentiment": sentiment,
-        "kb_sources": "; ".join(kb_sources or []),
-        "response": response,
+        "customer_name": customer_name,
+        "order_id": order_id,
+        "complaint": complaint.strip(),
+        "category": (category or "Other").strip(),
+        "urgency": (urgency or "Unknown").strip(),
+        "sentiment": (sentiment or "Unknown").strip(),
+        "kb_sources": "; ".join(
+            source.strip()
+            for source in (kb_sources or [])
+            if isinstance(source, str) and source.strip()
+        ),
+        "response": (response or "").strip(),
         "confidence": confidence_value,
         "status": status,
         "escalation_reason": escalation_reason,
     }
 
-    # Preserve older ticket records if the CSV schema has changed.
-    ensure_csv_schema()
+    with _CSV_LOCK:
+        TICKETS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    file_exists = (
-        TICKETS_FILE.exists()
-        and TICKETS_FILE.stat().st_size > 0
-    )
+        # Migration and duplicate detection must happen under the same lock
+        # as the append, so concurrent threads cannot both pass the check.
+        ensure_csv_schema()
+        existing_rows = _read_ticket_rows()
 
-    with TICKETS_FILE.open(
-        mode="a",
-        newline="",
-        encoding="utf-8",
-    ) as csvfile:
-        writer = csv.DictWriter(
-            csvfile,
-            fieldnames=CSV_COLUMNS,
+        duplicate = _find_recent_duplicate(
+            rows=existing_rows,
+            customer_name=customer_name,
+            order_id=order_id,
+            complaint=complaint,
         )
 
-        if not file_exists:
-            writer.writeheader()
+        if duplicate:
+            return json.dumps({
+                "ticket_id": duplicate.get("ticket_id", ""),
+                "status": duplicate.get("status", ""),
+                "escalation_reason": duplicate.get(
+                    "escalation_reason", ""
+                ),
+                "confidence": duplicate.get("confidence", "Unknown"),
+                "message": (
+                    "Duplicate submission detected. "
+                    "The existing ticket was retained."
+                ),
+                "duplicate": True,
+            })
 
-        writer.writerow(ticket)
+        file_exists = (
+            TICKETS_FILE.exists()
+            and TICKETS_FILE.stat().st_size > 0
+        )
+
+        try:
+            with TICKETS_FILE.open(
+                mode="a",
+                newline="",
+                encoding="utf-8",
+            ) as csvfile:
+                writer = csv.DictWriter(
+                    csvfile,
+                    fieldnames=CSV_COLUMNS,
+                    extrasaction="ignore",
+                )
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow(ticket)
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+
+        except (OSError, csv.Error) as exc:
+            raise RuntimeError(
+                f"Could not write the support ticket: {exc}"
+            ) from exc
 
     return json.dumps({
         "ticket_id": ticket_id,
@@ -290,6 +442,7 @@ def log_ticket(
         "escalation_reason": escalation_reason,
         "confidence": confidence_value,
         "message": "Ticket successfully logged.",
+        "duplicate": False,
     })
 
 
@@ -330,6 +483,8 @@ TOOL USAGE RULES:
    the deterministic escalation rules.
 9. Do not invent missing customer or order information.
 10. Do not claim that a ticket was logged unless the tool succeeds.
+11. If the tool reports duplicate=true, report the existing ticket ID.
+    Do not call the tool again.
 
 FINAL RESPONSE:
 

@@ -1,108 +1,161 @@
 
-"""Automated end-to-end test for Kovai Cart AI Support."""
+"""End-to-end workflow tests for Kovai Cart AI Support."""
 
 import asyncio
 import csv
 import json
+from datetime import datetime
 
 from config import TICKETS_FILE
 from team import build_ticket_task, create_model_client, create_support_team
 
 
-async def run_workflow_test():
-    print("\n=== KOVAI CART AUTOMATED WORKFLOW TEST ===\n")
+TEST_CASES = [
+    {
+        "name": "Normal delayed delivery",
+        "complaint": (
+            "My order has not arrived within the estimated delivery "
+            "period. Please help me understand what I should do next."
+        ),
+        "category": "Shipping",
+        "expected_status": "Resolved",
+    },
+    {
+        "name": "Damaged product and refund request",
+        "complaint": (
+            "My blender arrived broken. I want a refund immediately. "
+            "This is very poor service."
+        ),
+        "category": "Product",
+        "expected_status": "Escalated",
+    },
+    {
+        "name": "Unauthorised payment",
+        "complaint": (
+            "There is an unauthorised transaction on my card. "
+            "I did not make this payment and want it investigated."
+        ),
+        "category": None,
+        "expected_status": "Escalated",
+    },
+    {
+        "name": "Legal threat",
+        "complaint": (
+            "If you do not resolve my complaint, I will take legal action."
+        ),
+        "category": None,
+        "expected_status": "Escalated",
+    },
+    {
+        "name": "Question outside the knowledge base",
+        "complaint": (
+            "What colour shirt was worn by the warehouse manager yesterday?"
+        ),
+        "category": None,
+        "expected_status": "Escalated",
+    },
+]
 
-    customer_name = "Automated Test Customer"
-    order_id = "AUTOTEST001"
-    complaint = (
-        "My order has not arrived within the estimated delivery "
-        "period. Please help me understand what I should do next."
-    )
+
+def read_tickets():
+    """Read existing ticket records safely."""
+    if not TICKETS_FILE.exists():
+        return []
+
+    with TICKETS_FILE.open(
+        "r", newline="", encoding="utf-8"
+    ) as file:
+        return list(csv.DictReader(file))
+
+
+async def run_workflow_test():
+    print("\n=== KOVAI CART WORKFLOW TEST SUITE ===\n")
 
     model_client = create_model_client()
-    team = create_support_team(model_client)
+    results = []
+
+    # Unique IDs prevent previous test runs from affecting assertions.
+    run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 
     try:
-        # Remember the previous ticket count.
-        with TICKETS_FILE.open(
-            "r", newline="", encoding="utf-8"
-        ) as file:
-            previous_tickets = list(csv.DictReader(file))
+        for index, test_case in enumerate(TEST_CASES, start=1):
+            order_id = f"AUTOTEST{run_id}{index:02d}"
 
-        previous_count = len(previous_tickets)
+            print(f"\nTEST {index}: {test_case['name']}")
+            print("-" * 55)
 
-        # Build and run the four-agent workflow.
-        task = build_ticket_task(
-            complaint=complaint,
-            customer_name=customer_name,
-            order_id=order_id,
+            previous_ids = {
+                ticket.get("ticket_id")
+                for ticket in read_tickets()
+            }
+
+            team = create_support_team(model_client)
+
+            task = build_ticket_task(
+                complaint=test_case["complaint"],
+                customer_name="Automated Test Customer",
+                order_id=order_id,
+            )
+
+            result = await team.run(task=task)
+
+            # Find the ticket created by this workflow.
+            new_tickets = [
+                ticket
+                for ticket in read_tickets()
+                if ticket.get("ticket_id") not in previous_ids
+                and ticket.get("order_id") == order_id
+            ]
+
+            assert len(new_tickets) == 1, (
+                f"Expected exactly one ticket for {order_id}; "
+                f"found {len(new_tickets)}."
+            )
+
+            ticket = new_tickets[0]
+
+            # Verify ticket logging.
+            assert ticket["ticket_id"].startswith("KOV-")
+            assert ticket["response"].strip()
+            assert ticket["status"] in {"Resolved", "Escalated"}
+
+            # Verify classification when an exact category is expected.
+            if test_case["category"]:
+                assert ticket["category"] == test_case["category"], (
+                    f"Expected category {test_case['category']}, "
+                    f"got {ticket['category']}."
+                )
+
+            # Verify the expected escalation decision.
+            assert ticket["status"] == test_case["expected_status"], (
+                f"Expected {test_case['expected_status']}, "
+                f"got {ticket['status']}."
+            )
+
+            # Normal answers should have supporting knowledge sources.
+            if test_case["name"] == "Normal delayed delivery":
+                assert ticket["kb_sources"].strip(), (
+                    "Knowledge sources were not recorded."
+                )
+
+            results.append({
+                "test": test_case["name"],
+                "status": "PASS",
+                "ticket_id": ticket["ticket_id"],
+                "actual_status": ticket["status"],
+            })
+
+            print("PASS")
+            print(f"Ticket ID: {ticket['ticket_id']}")
+            print(f"Category: {ticket['category']}")
+            print(f"Status: {ticket['status']}")
+
+        print("\n=== FINAL TEST RESULTS ===\n")
+        print(json.dumps(results, indent=4))
+
+        print(
+            f"\nRESULT: {len(results)}/{len(TEST_CASES)} TESTS PASSED"
         )
-
-        print("Submitting test complaint...\n")
-
-        result = await team.run(task=task)
-
-        print("Agent workflow completed.\n")
-
-        # Display the final agent messages.
-        for message in result.messages:
-            if hasattr(message, "content"):
-                content = message.content
-
-                if isinstance(content, str):
-                    print(f"{message.source}:\n{content}\n")
-
-        # Verify that exactly one new ticket was recorded.
-        with TICKETS_FILE.open(
-            "r", newline="", encoding="utf-8"
-        ) as file:
-            tickets = list(csv.DictReader(file))
-
-        new_tickets = tickets[previous_count:]
-
-        matching_tickets = [
-            ticket for ticket in new_tickets
-            if ticket.get("order_id") == order_id
-        ]
-
-        assert len(matching_tickets) == 1, (
-            "Expected exactly one new ticket for AUTOTEST001."
-        )
-
-        ticket = matching_tickets[0]
-
-        assert ticket["ticket_id"].startswith("KOV-"), (
-            "Ticket ID was not generated correctly."
-        )
-
-        assert ticket["category"] == "Shipping", (
-            f"Unexpected category: {ticket['category']}"
-        )
-
-        assert ticket["kb_sources"].strip(), (
-            "No knowledge source was recorded."
-        )
-
-        assert ticket["response"].strip(), (
-            "Customer response was not recorded."
-        )
-
-        assert ticket["status"] in {"Resolved", "Escalated"}, (
-            f"Unexpected ticket status: {ticket['status']}"
-        )
-
-        print("\n=== AUTOMATED TEST RESULTS ===")
-        print("Agent workflow: PASS")
-        print("Ticket creation: PASS")
-        print("Ticket ID: PASS")
-        print("Complaint classification: PASS")
-        print("Knowledge source logging: PASS")
-        print("Customer response logging: PASS")
-        print("Escalation status: PASS")
-
-        print("\nTicket details:")
-        print(json.dumps(ticket, indent=4))
-
         print("\nOVERALL RESULT: PASS")
 
     finally:
